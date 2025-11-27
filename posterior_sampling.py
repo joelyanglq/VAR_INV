@@ -35,6 +35,7 @@ class PosteriorGuidanceConfig:
     max_lowpass_kernel: int = 9
     min_lowpass_kernel: int = 1
     max_downsample: int = 4
+    grad_steps: int = 1
     
     def grad_scale(self, ratio: float) -> float:
         if ratio < self.grad_start_ratio:
@@ -101,6 +102,10 @@ class MeasurementModel:
         target = self._apply_filter(target, ratio)
         return (pred - target).pow(2).mean()
     
+    def measure(self, x: Tensor) -> Tensor:
+        """Apply the measurement operator A(x) to obtain raw observations y."""
+        return self.operator(x)
+    
     def _apply_filter(self, tensor: Tensor, ratio: float) -> Tensor:
         if self.filter_fn is None:
             return tensor
@@ -124,6 +129,7 @@ class GradientGuidedVARSampler:
             measurement_model.filter_fn = FrequencyAwareFilter(config)
         self.measurement_model = measurement_model
         self.config = config
+        self._last_grad_stats = {"norm": 0.0, "delta": 0.0}
     
     @torch.no_grad()
     def _prepare_tokens(
@@ -149,7 +155,13 @@ class GradientGuidedVARSampler:
         label_B: Optional[Union[int, Tensor]] = None,
         g_seed: Optional[int] = None,
         capture_intermediate: bool = False,
-    ) -> Union[Tensor, Tuple[Tensor, List[Tensor]]]:
+        capture_token_trace: bool = False,
+    ) -> Union[
+        Tensor,
+        Tuple[Tensor, List[Tensor]],
+        Tuple[Tensor, List[Tensor], List[dict]],
+        Tuple[Tensor, List[dict]],
+    ]:
         var = self.var
         device = var.lvl_1L.device
         measurement = measurement.to(device)
@@ -165,6 +177,7 @@ class GradientGuidedVARSampler:
             cond_BD = sos
             f_hat = sos.new_zeros(B, var.Cvae, var.patch_nums[-1], var.patch_nums[-1])
             stage_imgs: Optional[List[Tensor]] = [] if capture_intermediate else None
+            token_trace: Optional[List[dict]] = [] if capture_token_trace else None
             
             for b in var.blocks:
                 b.attn.kv_caching(True)
@@ -184,8 +197,7 @@ class GradientGuidedVARSampler:
                     uncond_logits = logits_twice[B:]
                     cfg_logits = (1 + cfg_ratio) * cond_logits - cfg_ratio * uncond_logits
                     guided_logits = self._apply_gradient_guidance(
-                        cond_logits=cond_logits,
-                        cfg_logits=cfg_logits,
+                        base_logits=cfg_logits,
                         measurement=measurement,
                         f_hat=f_hat,
                         si=si,
@@ -194,6 +206,14 @@ class GradientGuidedVARSampler:
                         rng=rng,
                     )
                     
+                    if token_trace is not None:
+                        token_trace.append({
+                            "stage": si,
+                            "cfg_top": cfg_logits.argmax(dim=-1).detach().cpu(),
+                            "guided_top": guided_logits.argmax(dim=-1).detach().cpu(),
+                            "grad_norm": self._last_grad_stats["norm"],
+                            "max_delta": self._last_grad_stats["delta"],
+                        })
                     idx_Bl = sample_with_top_k_top_p_(guided_logits, rng=rng, top_k=self.config.top_k, top_p=self.config.top_p, num_samples=1)[:, :, 0]
                     if not self.config.more_smooth:
                         h_BChw = var.vae_quant_proxy[0].embedding(idx_Bl)
@@ -215,13 +235,16 @@ class GradientGuidedVARSampler:
             img = self._decode_current_fhat(f_hat)
             if stage_imgs is not None:
                 stage_imgs.append(img.detach().cpu())
+                if token_trace is not None:
+                    return img, stage_imgs, token_trace
                 return img, stage_imgs
+            if token_trace is not None:
+                return img, token_trace
         return img
     
     def _apply_gradient_guidance(
         self,
-        cond_logits: Tensor,
-        cfg_logits: Tensor,
+        base_logits: Tensor,
         measurement: Tensor,
         f_hat: Tensor,
         si: int,
@@ -231,25 +254,37 @@ class GradientGuidedVARSampler:
     ) -> Tensor:
         grad_scale = self.config.grad_scale(ratio)
         if grad_scale <= 0.0:
-            return cfg_logits
+            return base_logits
         
-        with torch.enable_grad():
-            logits_for_grad = cond_logits.detach().clone()
-            logits_for_grad.requires_grad_(True)
-            tau = max(self.config.gumbel_tau(ratio), 1e-3)
-            soft_codes = gumbel_softmax_with_rng(logits_for_grad, tau=tau, hard=False, dim=-1, rng=rng)
-            emb = self.var.vae_quant_proxy[0].embedding.weight.detach()
-            h_soft = soft_codes @ emb.unsqueeze(0)
-            h_soft = h_soft.transpose(1, 2).reshape(cond_logits.shape[0], self.var.Cvae, pn, pn)
-            probe = f_hat.detach().clone()
-            probe, _ = self.var.vae_quant_proxy[0].get_next_autoregressive_input(si, len(self.var.patch_nums), probe, h_soft)
-            recon = self.var.vae_proxy[0].fhat_to_img(probe).add_(1).mul_(0.5)
-            loss = self.measurement_model.loss(recon, measurement, ratio)
-            grad = torch.autograd.grad(loss, logits_for_grad, retain_graph=False, create_graph=False)[0]
+        steps = max(1, self.config.grad_steps)
+        guided_logits = base_logits.clone()
+        max_delta = 0.0
+        grad_norm = 0.0
+        for _ in range(steps):
+            with torch.enable_grad():
+                logits_for_grad = guided_logits.detach().clone()
+                logits_for_grad.requires_grad_(True)
+                tau = max(self.config.gumbel_tau(ratio), 1e-3)
+                soft_codes = gumbel_softmax_with_rng(logits_for_grad, tau=tau, hard=False, dim=-1, rng=rng)
+                emb = self.var.vae_quant_proxy[0].embedding.weight.detach()
+                h_soft = soft_codes @ emb.unsqueeze(0)
+                h_soft = h_soft.transpose(1, 2).reshape(base_logits.shape[0], self.var.Cvae, pn, pn)
+                probe = f_hat.detach().clone()
+                probe, _ = self.var.vae_quant_proxy[0].get_next_autoregressive_input(si, len(self.var.patch_nums), probe, h_soft)
+                recon = self.var.vae_proxy[0].fhat_to_img(probe).add_(1).mul_(0.5)
+                loss = self.measurement_model.loss(recon, measurement, ratio)
+                grad = torch.autograd.grad(loss, logits_for_grad, retain_graph=False, create_graph=False)[0]
+                grad_norm = grad.abs().mean().item()
+            
+            if self.config.grad_clip > 0:
+                grad = grad.clamp_(min=-self.config.grad_clip, max=self.config.grad_clip)
+            update = grad_scale * grad
+            guided_logits = guided_logits - update
+            max_delta = max(max_delta, update.abs().max().item())
         
-        if self.config.grad_clip > 0:
-            grad = grad.clamp_(min=-self.config.grad_clip, max=self.config.grad_clip)
-        return cfg_logits - grad_scale * grad
+        self._last_grad_stats["norm"] = grad_norm
+        self._last_grad_stats["delta"] = max_delta
+        return guided_logits
 
     def _decode_current_fhat(self, f_hat: Tensor) -> Tensor:
         img = self.var.vae_proxy[0].fhat_to_img(f_hat.detach().clone()).add_(1).mul_(0.5)

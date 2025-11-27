@@ -151,6 +151,7 @@ class VAR(nn.Module):
         sos = cond_BD = self.class_emb(torch.cat((label_B, torch.full_like(label_B, fill_value=self.num_classes)), dim=0))
         
         lvl_pos = self.lvl_embed(self.lvl_1L) + self.pos_1LC
+        # 形状 (2B, L, V)，前 B 为条件，后 B 为无条件。
         next_token_map = sos.unsqueeze(1).expand(2 * B, self.first_l, -1) + self.pos_start.expand(2 * B, self.first_l, -1) + lvl_pos[:, :self.first_l]
         
         cur_L = 0
