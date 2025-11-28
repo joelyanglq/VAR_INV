@@ -36,6 +36,7 @@ class PosteriorGuidanceConfig:
     min_lowpass_kernel: int = 1
     max_downsample: int = 4
     grad_steps: int = 1
+    grad_stop_before_stage: int = 0
     
     def grad_scale(self, ratio: float) -> float:
         if ratio < self.grad_start_ratio:
@@ -156,6 +157,7 @@ class GradientGuidedVARSampler:
         g_seed: Optional[int] = None,
         capture_intermediate: bool = False,
         capture_token_trace: bool = False,
+        token_constraints: Optional[List[dict]] = None,
     ) -> Union[
         Tensor,
         Tuple[Tensor, List[Tensor]],
@@ -204,15 +206,24 @@ class GradientGuidedVARSampler:
                         pn=pn,
                         ratio=ratio,
                         rng=rng,
+                        allow_grad=si >= self.config.grad_stop_before_stage,
                     )
                     
+                    if token_constraints is not None and si < len(token_constraints) and token_constraints[si] is not None:
+                        tc = token_constraints[si]
+                        mask = tc["mask"].to(device)
+                        idx_force = tc["idx"].to(device)
+                        guided_logits = self._apply_token_constraint(guided_logits, mask=mask, idx_force=idx_force)
+                    
                     if token_trace is not None:
+                        mask_sum = int(mask.sum().item()) if token_constraints is not None and si < len(token_constraints) and token_constraints[si] is not None else 0
                         token_trace.append({
                             "stage": si,
                             "cfg_top": cfg_logits.argmax(dim=-1).detach().cpu(),
                             "guided_top": guided_logits.argmax(dim=-1).detach().cpu(),
                             "grad_norm": self._last_grad_stats["norm"],
                             "max_delta": self._last_grad_stats["delta"],
+                            "forced_tokens": mask_sum,
                         })
                     idx_Bl = sample_with_top_k_top_p_(guided_logits, rng=rng, top_k=self.config.top_k, top_p=self.config.top_p, num_samples=1)[:, :, 0]
                     if not self.config.more_smooth:
@@ -251,8 +262,11 @@ class GradientGuidedVARSampler:
         pn: int,
         ratio: float,
         rng: Optional[torch.Generator],
+        allow_grad: bool = True,
     ) -> Tensor:
         grad_scale = self.config.grad_scale(ratio)
+        if not allow_grad:
+            grad_scale = 0.0
         if grad_scale <= 0.0:
             return base_logits
 
@@ -310,6 +324,22 @@ class GradientGuidedVARSampler:
         self._last_grad_stats["norm"] = grad_norm
         self._last_grad_stats["delta"] = max_delta
         return guided_logits
+
+    @staticmethod
+    def _apply_token_constraint(logits: Tensor, mask: Tensor, idx_force: Tensor) -> Tensor:
+        """
+        Force logits at masked positions to take the given token index.
+        logits: (B, l, V)
+        mask:   (B, l) boolean
+        idx_force: (B, l) long
+        """
+        if mask is None or mask.numel() == 0:
+            return logits
+        logits = logits.clone()
+        mask_exp = mask.unsqueeze(-1)
+        logits.masked_fill_(mask_exp, -torch.inf)
+        logits.scatter_(2, idx_force.unsqueeze(-1), 1e4)
+        return logits
 
     def _decode_current_fhat(self, f_hat: Tensor) -> Tensor:
         img = self.var.vae_proxy[0].fhat_to_img(f_hat.detach().clone()).add_(1).mul_(0.5)

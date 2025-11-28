@@ -49,6 +49,23 @@ class MaskingMeasurement(BaseMeasurement):
         mask = torch.rand(shape, generator=generator)
         mask = (mask < keep_ratio).float()
         return MaskingMeasurement(mask=mask)
+    
+    @staticmethod
+    def rectangular(
+        h: int,
+        w: int,
+        top: int,
+        left: int,
+        height: int,
+        width: int,
+        device: torch.device,
+    ) -> "MaskingMeasurement":
+        """
+        Build a rectangle mask where the rectangle region is set to 0 (unknown) and others to 1 (known).
+        """
+        mask = torch.ones(1, 1, h, w, device=device)
+        mask[..., top:top+height, left:left+width] = 0.0
+        return MaskingMeasurement(mask=mask)
 
 
 @dataclass
