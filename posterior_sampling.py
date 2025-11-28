@@ -100,7 +100,7 @@ class MeasurementModel:
         target = measurement
         pred = self._apply_filter(pred, ratio)
         target = self._apply_filter(target, ratio)
-        return (pred - target).pow(2).mean()
+        return (pred - target).pow(2).sum()
     
     def measure(self, x: Tensor) -> Tensor:
         """Apply the measurement operator A(x) to obtain raw observations y."""
@@ -255,25 +255,50 @@ class GradientGuidedVARSampler:
         grad_scale = self.config.grad_scale(ratio)
         if grad_scale <= 0.0:
             return base_logits
-        
+
         steps = max(1, self.config.grad_steps)
         guided_logits = base_logits.clone()
         max_delta = 0.0
         grad_norm = 0.0
+        quant = self.var.vae_quant_proxy[0]
+        SN = len(self.var.patch_nums)
+        HW = quant.v_patch_nums[-1]
         for _ in range(steps):
             with torch.enable_grad():
                 logits_for_grad = guided_logits.detach().clone()
+                # 强制拉回 Logits 的分布，确保 Softmax 有梯度
+                logits_std = logits_for_grad.std(dim=-1, keepdim=True) + 1e-6
+                logits_for_grad = logits_for_grad / logits_std 
+
                 logits_for_grad.requires_grad_(True)
                 tau = max(self.config.gumbel_tau(ratio), 1e-3)
                 soft_codes = gumbel_softmax_with_rng(logits_for_grad, tau=tau, hard=False, dim=-1, rng=rng)
-                emb = self.var.vae_quant_proxy[0].embedding.weight.detach()
-                h_soft = soft_codes @ emb.unsqueeze(0)
-                h_soft = h_soft.transpose(1, 2).reshape(base_logits.shape[0], self.var.Cvae, pn, pn)
-                probe = f_hat.detach().clone()
-                probe, _ = self.var.vae_quant_proxy[0].get_next_autoregressive_input(si, len(self.var.patch_nums), probe, h_soft)
-                recon = self.var.vae_proxy[0].fhat_to_img(probe).add_(1).mul_(0.5)
+                emb = quant.embedding.weight   # (V, Cvae)
+                h_soft = soft_codes @ emb.unsqueeze(0)  # (B, L, Cvae)
+                h_soft = h_soft.transpose(1, 2).reshape(base_logits.shape[0], self.var.Cvae, pn, pn)  # (B, Cvae, pn, pn)
+                
+                # 4. 上采样到全尺寸（若非最后一阶段）& 残差量化
+                ratio_si = si / max(1, SN - 1)
+                if si != SN - 1:
+                    h_up = quant.quant_resi[ratio_si](F.interpolate(h_soft, size=(HW, HW), mode='bicubic'))
+                else:
+                    h_up = quant.quant_resi[ratio_si](h_soft)
+                probe = f_hat.detach() + h_up  # 累积：前阶段 + 当前
+                vae = self.var.vae_proxy[0]
+                recon = vae.decoder(vae.post_quant_conv(probe)).add_(1).mul_(0.5)  # avoid clamp to keep gradients alive
                 loss = self.measurement_model.loss(recon, measurement, ratio)
                 grad = torch.autograd.grad(loss, logits_for_grad, retain_graph=False, create_graph=False)[0]
+
+                g_std = grad.std()
+                g_mean = grad.mean()
+                
+                # 避免除以零
+                if g_std > 1e-8:
+                     # 将梯度标准化到 unit variance
+                    grad_normalized = (grad - g_mean) / g_std
+                else:
+                    grad_normalized = grad
+
                 grad_norm = grad.abs().mean().item()
             
             if self.config.grad_clip > 0:
